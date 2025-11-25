@@ -285,13 +285,15 @@ class AttendanceSystem:
         reg_password.bind('<Return>', on_enter)
         
         button_frame = tk.Frame(dialog, bg='#f0f0f0')
-        button_frame.pack(pady=20)
+        button_frame.pack(pady=20, padx=20)
         
-        tk.Button(button_frame, text="Register", font=('Arial', 12, 'bold'),
-                 bg='#2196F3', fg='white', width=15, command=register).pack(side=tk.LEFT, padx=5)
+        register_btn = tk.Button(button_frame, text="Register", font=('Arial', 12, 'bold'),
+                 bg='#2196F3', fg='white', width=15, height=2, command=register, cursor='hand2')
+        register_btn.pack(side=tk.LEFT, padx=10, expand=True, fill=tk.X)
         
-        tk.Button(button_frame, text="Cancel", font=('Arial', 12, 'bold'),
-                 bg='#757575', fg='white', width=15, command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+        cancel_btn = tk.Button(button_frame, text="Cancel", font=('Arial', 12, 'bold'),
+                 bg='#757575', fg='white', width=15, height=2, command=dialog.destroy, cursor='hand2')
+        cancel_btn.pack(side=tk.LEFT, padx=10, expand=True, fill=tk.X)
     
     def show_main_screen(self):
         """Display main screen after login"""
@@ -352,6 +354,13 @@ class AttendanceSystem:
                                   bg='#607D8B', fg='white', width=20, height=3,
                                   command=self.show_attendance_report)
             report_btn.grid(row=2, column=1, padx=10, pady=10)
+            
+            # Admin Profile Button
+            admin_profile_btn = tk.Button(button_frame, text="Admin Profile", 
+                                         font=('Arial', 12, 'bold'),
+                                         bg='#E91E63', fg='white', width=20, height=3,
+                                         command=self.show_admin_profile)
+            admin_profile_btn.grid(row=3, column=0, columnspan=2, padx=10, pady=10)
         
         # Logout Button
         logout_btn = tk.Button(self.root, text="Logout", font=('Arial', 10),
@@ -365,18 +374,29 @@ class AttendanceSystem:
         if not username:
             return
         
-        # Check if student exists
+        username = username.strip()
+        if not username:
+            messagebox.showerror("Error", "Please enter a valid username.")
+            return
+        
+        # IMPORTANT: Check if student is registered in the database before allowing photo capture
         try:
-            result = self.execute_db('SELECT COUNT(*) FROM students WHERE username = ?', 
+            # Check if student exists in students table
+            result = self.execute_db('SELECT username FROM students WHERE username = ?', 
                                     (username,), fetch='one')
-            if result[0] == 0:
-                messagebox.showerror("Error", "Student not found. Please register the student first.")
+            if result is None:
+                messagebox.showerror("Error", 
+                                    f"Student '{username}' is not registered in the database.\n\n"
+                                    "Please register the student first using 'Register New Student' option.")
                 return
         except sqlite3.OperationalError as e:
             if "database is locked" in str(e).lower():
                 messagebox.showerror("Error", "Database is busy. Please try again in a moment.")
             else:
-                messagebox.showerror("Error", f"Error checking student: {str(e)}")
+                messagebox.showerror("Error", f"Error checking student registration: {str(e)}")
+            return
+        except Exception as e:
+            messagebox.showerror("Error", f"Error checking student registration: {str(e)}")
             return
         
         # Create directory for student photos
@@ -796,6 +816,197 @@ class AttendanceSystem:
                                 text=f"Total Students: {total_students} | Today's Attendance: {today_attendance}",
                                 font=('Arial', 12, 'bold'))
         summary_label.pack()
+    
+    def show_admin_profile(self):
+        """Display admin profile window with password management"""
+        if not self.is_admin:
+            messagebox.showerror("Error", "Access denied. Admin privileges required.")
+            return
+        
+        profile_window = tk.Toplevel(self.root)
+        profile_window.title("Admin Profile")
+        profile_window.geometry("900x700")
+        profile_window.configure(bg='#f0f0f0')
+        profile_window.transient(self.root)
+        
+        # Title
+        title_label = tk.Label(profile_window, text="Admin Profile Management", 
+                              font=('Arial', 18, 'bold'), bg='#f0f0f0')
+        title_label.pack(pady=20)
+        
+        # Create notebook for tabs
+        notebook = ttk.Notebook(profile_window)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        
+        # Tab 1: Change Own Password
+        change_pass_frame = tk.Frame(notebook, bg='#f0f0f0')
+        notebook.add(change_pass_frame, text="Change My Password")
+        
+        tk.Label(change_pass_frame, text="Change Admin Password", 
+                font=('Arial', 14, 'bold'), bg='#f0f0f0').pack(pady=20)
+        
+        pass_frame = tk.Frame(change_pass_frame, bg='#f0f0f0')
+        pass_frame.pack(pady=30)
+        
+        tk.Label(pass_frame, text="Current Password:", font=('Arial', 12), bg='#f0f0f0').grid(row=0, column=0, padx=10, pady=10, sticky='e')
+        current_pass_entry = tk.Entry(pass_frame, font=('Arial', 12), width=25, show='*')
+        current_pass_entry.grid(row=0, column=1, padx=10, pady=10)
+        
+        tk.Label(pass_frame, text="New Password:", font=('Arial', 12), bg='#f0f0f0').grid(row=1, column=0, padx=10, pady=10, sticky='e')
+        new_pass_entry = tk.Entry(pass_frame, font=('Arial', 12), width=25, show='*')
+        new_pass_entry.grid(row=1, column=1, padx=10, pady=10)
+        
+        tk.Label(pass_frame, text="Confirm Password:", font=('Arial', 12), bg='#f0f0f0').grid(row=2, column=0, padx=10, pady=10, sticky='e')
+        confirm_pass_entry = tk.Entry(pass_frame, font=('Arial', 12), width=25, show='*')
+        confirm_pass_entry.grid(row=2, column=1, padx=10, pady=10)
+        
+        def change_admin_password():
+            current = current_pass_entry.get().strip()
+            new = new_pass_entry.get().strip()
+            confirm = confirm_pass_entry.get().strip()
+            
+            if not current or not new or not confirm:
+                messagebox.showerror("Error", "Please fill all fields")
+                return
+            
+            # Verify current password
+            try:
+                result = self.execute_db('SELECT password FROM users WHERE username = ?', 
+                                        (self.current_user,), fetch='one')
+                if not result or result[0] != current:
+                    messagebox.showerror("Error", "Current password is incorrect")
+                    return
+                
+                if new != confirm:
+                    messagebox.showerror("Error", "New password and confirm password do not match")
+                    return
+                
+                if len(new) < 3:
+                    messagebox.showerror("Error", "Password must be at least 3 characters")
+                    return
+                
+                # Update password
+                self.execute_db('UPDATE users SET password = ? WHERE username = ?', 
+                              (new, self.current_user))
+                messagebox.showinfo("Success", "Password changed successfully!")
+                current_pass_entry.delete(0, tk.END)
+                new_pass_entry.delete(0, tk.END)
+                confirm_pass_entry.delete(0, tk.END)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to change password: {str(e)}")
+        
+        tk.Button(pass_frame, text="Change Password", font=('Arial', 12, 'bold'),
+                 bg='#4CAF50', fg='white', width=20, command=change_admin_password).grid(row=3, column=0, columnspan=2, pady=20)
+        
+        # Tab 2: View All Students
+        view_students_frame = tk.Frame(notebook, bg='#f0f0f0')
+        notebook.add(view_students_frame, text="View All Students")
+        
+        tk.Label(view_students_frame, text="All Students Credentials", 
+                font=('Arial', 14, 'bold'), bg='#f0f0f0').pack(pady=10)
+        
+        # Create treeview for students
+        students_tree = ttk.Treeview(view_students_frame, columns=('Username', 'Password'), 
+                                    show='headings', height=20)
+        students_tree.heading('Username', text='Username')
+        students_tree.heading('Password', text='Password')
+        students_tree.column('Username', width=200)
+        students_tree.column('Password', width=200)
+        
+        # Scrollbar for students tree
+        students_scrollbar = ttk.Scrollbar(view_students_frame, orient=tk.VERTICAL, command=students_tree.yview)
+        students_tree.configure(yscrollcommand=students_scrollbar.set)
+        
+        def load_students():
+            # Clear existing items
+            for item in students_tree.get_children():
+                students_tree.delete(item)
+            
+            try:
+                # Get all students from students table
+                records = self.execute_db('SELECT username, password FROM students ORDER BY username', 
+                                        fetch=True)
+                for record in records:
+                    students_tree.insert('', 'end', values=record)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to load students: {str(e)}")
+        
+        load_students()
+        
+        refresh_btn = tk.Button(view_students_frame, text="Refresh", font=('Arial', 10),
+                               bg='#2196F3', fg='white', command=load_students)
+        refresh_btn.pack(pady=5)
+        
+        students_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+        students_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, pady=10)
+        
+        # Tab 3: Change Student Password
+        change_student_frame = tk.Frame(notebook, bg='#f0f0f0')
+        notebook.add(change_student_frame, text="Change Student Password")
+        
+        tk.Label(change_student_frame, text="Change Student Password", 
+                font=('Arial', 14, 'bold'), bg='#f0f0f0').pack(pady=20)
+        
+        student_pass_frame = tk.Frame(change_student_frame, bg='#f0f0f0')
+        student_pass_frame.pack(pady=30)
+        
+        tk.Label(student_pass_frame, text="Student Username:", font=('Arial', 12), bg='#f0f0f0').grid(row=0, column=0, padx=10, pady=10, sticky='e')
+        student_username_entry = tk.Entry(student_pass_frame, font=('Arial', 12), width=25)
+        student_username_entry.grid(row=0, column=1, padx=10, pady=10)
+        
+        tk.Label(student_pass_frame, text="New Password:", font=('Arial', 12), bg='#f0f0f0').grid(row=1, column=0, padx=10, pady=10, sticky='e')
+        student_new_pass_entry = tk.Entry(student_pass_frame, font=('Arial', 12), width=25, show='*')
+        student_new_pass_entry.grid(row=1, column=1, padx=10, pady=10)
+        
+        tk.Label(student_pass_frame, text="Confirm Password:", font=('Arial', 12), bg='#f0f0f0').grid(row=2, column=0, padx=10, pady=10, sticky='e')
+        student_confirm_pass_entry = tk.Entry(student_pass_frame, font=('Arial', 12), width=25, show='*')
+        student_confirm_pass_entry.grid(row=2, column=1, padx=10, pady=10)
+        
+        def change_student_password():
+            username = student_username_entry.get().strip()
+            new = student_new_pass_entry.get().strip()
+            confirm = student_confirm_pass_entry.get().strip()
+            
+            if not username or not new or not confirm:
+                messagebox.showerror("Error", "Please fill all fields")
+                return
+            
+            # Check if student exists
+            try:
+                result = self.execute_db('SELECT COUNT(*) FROM students WHERE username = ?', 
+                                        (username,), fetch='one')
+                if not result or result[0] == 0:
+                    messagebox.showerror("Error", f"Student '{username}' does not exist")
+                    return
+                
+                if new != confirm:
+                    messagebox.showerror("Error", "New password and confirm password do not match")
+                    return
+                
+                if len(new) < 3:
+                    messagebox.showerror("Error", "Password must be at least 3 characters")
+                    return
+                
+                # Update password in students table
+                self.execute_db('UPDATE students SET password = ? WHERE username = ?', 
+                              (new, username))
+                
+                # Also update in users table if exists
+                try:
+                    self.execute_db('UPDATE users SET password = ? WHERE username = ?', 
+                                  (new, username))
+                except:
+                    pass  # User might not exist in users table, that's okay
+                
+                messagebox.showinfo("Success", f"Password changed successfully for {username}!")
+                student_username_entry.delete(0, tk.END)
+                student_new_pass_entry.delete(0, tk.END)
+                student_confirm_pass_entry.delete(0, tk.END)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to change password: {str(e)}")
+        
+        tk.Button(student_pass_frame, text="Change Student Password", font=('Arial', 12, 'bold'),
+                 bg='#F44336', fg='white', width=25, command=change_student_password).grid(row=3, column=0, columnspan=2, pady=20)
     
     def logout(self):
         """Logout and return to login screen"""
