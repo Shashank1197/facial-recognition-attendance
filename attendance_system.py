@@ -5,9 +5,12 @@ import numpy as np
 import os
 import sqlite3
 import face_recognition
-from datetime import datetime
+from datetime import datetime, timedelta
 import pickle
 import shutil
+import random
+import re
+import threading
 
 class AttendanceSystem:
     def __init__(self, root):
@@ -19,6 +22,10 @@ class AttendanceSystem:
         self.current_user = None
         self.is_admin = False
         self.camera = None
+        self.camera_lock = threading.Lock()
+        self.camera_thread = None
+        self.camera_ready = threading.Event()
+        self.encoding_cache = None
         
         # Initialize database
         self.init_database()
@@ -34,8 +41,7 @@ class AttendanceSystem:
     
     def on_closing(self):
         """Handle application closing"""
-        if self.camera is not None:
-            self.camera.release()
+        self.release_camera()
         if hasattr(self, 'conn'):
             self.conn.close()
         self.root.destroy()
@@ -56,6 +62,8 @@ class AttendanceSystem:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT UNIQUE NOT NULL,
                 password TEXT NOT NULL,
+                email TEXT,
+                otp_verified INTEGER DEFAULT 0,
                 is_admin INTEGER DEFAULT 0
             )
         ''')
@@ -66,6 +74,7 @@ class AttendanceSystem:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT UNIQUE NOT NULL,
                 password TEXT NOT NULL,
+                email TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -82,6 +91,11 @@ class AttendanceSystem:
                 FOREIGN KEY (student_username) REFERENCES students(username)
             )
         ''')
+        
+        # Ensure new columns exist for legacy databases
+        self.ensure_column('users', 'email', 'email TEXT')
+        self.ensure_column('users', 'otp_verified', 'otp_verified INTEGER DEFAULT 0')
+        self.ensure_column('students', 'email', 'email TEXT')
         
         # Create default admin user if not exists
         try:
@@ -140,6 +154,134 @@ class AttendanceSystem:
         for directory in directories:
             if not os.path.exists(directory):
                 os.makedirs(directory)
+
+    def ensure_column(self, table_name, column_name, column_definition):
+        """Add a column to a table if it doesn't already exist"""
+        try:
+            self.cursor.execute(f'PRAGMA table_info({table_name})')
+            columns = [info[1] for info in self.cursor.fetchall()]
+            if column_name not in columns:
+                self.cursor.execute(f'ALTER TABLE {table_name} ADD COLUMN {column_definition}')
+                self.conn.commit()
+        except Exception as e:
+            print(f"Warning: Could not add column {column_name} to {table_name}: {e}")
+
+    @staticmethod
+    def is_valid_email(value):
+        """Return True if value matches a basic email pattern"""
+        pattern = r'^[^@]+@[^@]+\.[^@]+$'
+        return re.match(pattern, value) is not None
+
+    @staticmethod
+    def generate_otp():
+        """Generate a simple 6-digit OTP code"""
+        return f"{random.randint(0, 999999):06d}"
+
+    def load_face_encodings(self):
+        """Load face encodings once and cache them for faster reuse"""
+        encoding_file = os.path.join('trained_models', 'face_encodings.pkl')
+        if not os.path.exists(encoding_file):
+            return None
+        
+        file_mtime = os.path.getmtime(encoding_file)
+        if self.encoding_cache and self.encoding_cache.get('mtime') == file_mtime:
+            return self.encoding_cache.get('data')
+        
+        with open(encoding_file, 'rb') as f:
+            encoding_data = pickle.load(f)
+            self.encoding_cache = {
+                'mtime': file_mtime,
+                'data': encoding_data
+            }
+            return encoding_data
+
+    def warm_up_camera(self, cap, frames=5):
+        """Read a few frames to let auto-exposure settle"""
+        for _ in range(frames):
+            ret, _ = cap.read()
+            if not ret:
+                break
+
+    def create_camera_instance(self):
+        """Create and warm a new camera instance"""
+        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, None]
+        for backend in backends:
+            try:
+                cap = cv2.VideoCapture(0, backend) if backend is not None else cv2.VideoCapture(0)
+            except Exception:
+                continue
+
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                self.warm_up_camera(cap, frames=8)
+                return cap
+
+            cap.release()
+        return None
+
+    def preload_camera_async(self):
+        """Open the camera on a background thread to reduce user wait time"""
+        if self.camera_thread and self.camera_thread.is_alive():
+            return
+
+        def _target():
+            cap = self.create_camera_instance()
+            if not cap:
+                return
+            with self.camera_lock:
+                if self.camera and self.camera.isOpened():
+                    cap.release()
+                    return
+                self.camera = cap
+                self.camera_ready.set()
+
+        self.camera_thread = threading.Thread(target=_target, daemon=True)
+        self.camera_thread.start()
+
+    def release_camera(self):
+        """Release and reset the cached camera"""
+        with self.camera_lock:
+            if self.camera and self.camera.isOpened():
+                self.camera.release()
+            self.camera = None
+            self.camera_ready.clear()
+
+    def upsert_student_record(self, username, password, email):
+        """Ensure the students table mirrors the login credentials"""
+        try:
+            existing = self.execute_db(
+                'SELECT id FROM students WHERE username = ?',
+                (username,),
+                fetch='one'
+            )
+            if existing:
+                self.execute_db(
+                    'UPDATE students SET password = ?, email = ? WHERE username = ?',
+                    (password, email, username)
+                )
+            else:
+                self.execute_db(
+                    'INSERT INTO students (username, password, email) VALUES (?, ?, ?)',
+                    (username, password, email)
+                )
+        except Exception as e:
+            raise e
+
+    def open_camera(self):
+        """Return a warmed camera instance, opening it if needed"""
+        with self.camera_lock:
+            if self.camera and self.camera.isOpened():
+                return self.camera
+
+        cap = self.create_camera_instance()
+        if cap:
+            with self.camera_lock:
+                self.camera = cap
+                self.camera_ready.set()
+            return self.camera
+        
+        return None
     
     def show_login_screen(self):
         """Display login/register screen"""
@@ -214,7 +356,7 @@ class AttendanceSystem:
         """Show registration dialog"""
         dialog = tk.Toplevel(self.root)
         dialog.title("Register New User")
-        dialog.geometry("400x250")
+        dialog.geometry("420x420")
         dialog.configure(bg='#f0f0f0')
         dialog.transient(self.root)
         dialog.grab_set()
@@ -225,27 +367,63 @@ class AttendanceSystem:
         y = (dialog.winfo_screenheight() // 2) - (250 // 2)
         dialog.geometry(f"400x250+{x}+{y}")
         
-        tk.Label(dialog, text="Username:", font=('Arial', 12), bg='#f0f0f0').pack(pady=10)
-        reg_username = tk.Entry(dialog, font=('Arial', 12), width=25)
-        reg_username.pack(pady=5)
+        tk.Label(dialog, text="Username:", font=('Arial', 12), bg='#f0f0f0').pack(pady=5)
+        reg_username = tk.Entry(dialog, font=('Arial', 12), width=30)
+        reg_username.pack(pady=2)
         reg_username.focus()
         
-        tk.Label(dialog, text="Password:", font=('Arial', 12), bg='#f0f0f0').pack(pady=10)
-        reg_password = tk.Entry(dialog, font=('Arial', 12), width=25, show='*')
-        reg_password.pack(pady=5)
+        tk.Label(dialog, text="Email:", font=('Arial', 12), bg='#f0f0f0').pack(pady=5)
+        reg_email = tk.Entry(dialog, font=('Arial', 12), width=30)
+        reg_email.pack(pady=2)
+        
+        tk.Label(dialog, text="Password:", font=('Arial', 12), bg='#f0f0f0').pack(pady=5)
+        reg_password = tk.Entry(dialog, font=('Arial', 12), width=30, show='*')
+        reg_password.pack(pady=2)
+        
+        otp_frame = tk.Frame(dialog, bg='#f0f0f0')
+        otp_frame.pack(pady=10)
+        
+        tk.Label(otp_frame, text="OTP:", font=('Arial', 12), bg='#f0f0f0').grid(row=0, column=0, padx=5, pady=5, sticky='e')
+        otp_entry = tk.Entry(otp_frame, font=('Arial', 12), width=15)
+        otp_entry.grid(row=0, column=1, padx=5, pady=5)
+        
+        otp_meta = {'code': None, 'expires_at': None, 'email': None}
+        
+        def send_otp():
+            email = reg_email.get().strip()
+            if not email:
+                messagebox.showerror("Error", "Please enter an email before requesting OTP.")
+                return
+            if not self.is_valid_email(email):
+                messagebox.showerror("Error", "Please enter a valid email address.")
+                return
+            
+            otp_value = self.generate_otp()
+            otp_meta['code'] = otp_value
+            otp_meta['expires_at'] = datetime.now() + timedelta(minutes=5)
+            otp_meta['email'] = email.lower()
+            
+            status_label.config(text=f"OTP sent to {email}. (Demo OTP: {otp_value})", fg='blue')
+            messagebox.showinfo("OTP Verification", f"OTP has been generated.\n(For demo use this OTP: {otp_value})")
+        
+        send_otp_btn = tk.Button(otp_frame, text="Send OTP", font=('Arial', 10, 'bold'),
+                                 bg='#4CAF50', fg='white', width=12, command=send_otp, cursor='hand2')
+        send_otp_btn.grid(row=0, column=2, padx=5, pady=5)
         
         status_label = tk.Label(dialog, text="", font=('Arial', 10), bg='#f0f0f0', fg='red')
-        status_label.pack(pady=5)
+        status_label.pack(pady=5, fill=tk.X, padx=15)
         
         def register():
             username = reg_username.get().strip()
+            email = reg_email.get().strip()
             password = reg_password.get().strip()
+            otp_value = otp_entry.get().strip()
             
             status_label.config(text="")
             
-            if not username or not password:
-                status_label.config(text="Please enter both username and password", fg='red')
-                messagebox.showerror("Error", "Please enter both username and password")
+            if not username or not password or not email:
+                status_label.config(text="Please fill username, email, and password", fg='red')
+                messagebox.showerror("Error", "Please fill username, email, and password")
                 return
             
             if len(username) < 3:
@@ -258,9 +436,42 @@ class AttendanceSystem:
                 messagebox.showerror("Error", "Password must be at least 3 characters")
                 return
             
+            if not self.is_valid_email(email):
+                status_label.config(text="Please enter a valid email", fg='red')
+                messagebox.showerror("Error", "Please enter a valid email")
+                return
+            
+            if not otp_value:
+                status_label.config(text="Please enter the OTP sent to your email.", fg='red')
+                messagebox.showerror("Error", "Please enter the OTP.")
+                return
+            
+            if not otp_meta['code']:
+                status_label.config(text="Please generate and enter OTP", fg='red')
+                messagebox.showerror("Error", "Please generate OTP before registering")
+                return
+            
+            if not otp_meta['expires_at'] or datetime.now() > otp_meta['expires_at']:
+                status_label.config(text="OTP expired. Please request a new one.", fg='red')
+                messagebox.showerror("Error", "OTP expired. Please request a new one.")
+                return
+            
+            if email.lower() != otp_meta['email']:
+                status_label.config(text="Email changed after OTP. Please regenerate OTP.", fg='red')
+                messagebox.showerror("Error", "Email changed after OTP. Please regenerate OTP.")
+                return
+            
+            if otp_value != otp_meta['code']:
+                status_label.config(text="Invalid OTP. Please try again.", fg='red')
+                messagebox.showerror("Error", "Invalid OTP. Please try again.")
+                return
+            
             try:
-                self.execute_db('INSERT INTO users (username, password) VALUES (?, ?)', 
-                               (username, password))
+                self.execute_db(
+                    'INSERT INTO users (username, password, email, otp_verified) VALUES (?, ?, ?, 1)', 
+                    (username, password, email)
+                )
+                self.upsert_student_record(username, password, email)
                 status_label.config(text="Registration successful!", fg='green')
                 messagebox.showinfo("Success", "Registration successful! Please login.")
                 dialog.destroy()
@@ -367,6 +578,9 @@ class AttendanceSystem:
                                bg='#757575', fg='white', width=15,
                                command=self.logout)
         logout_btn.pack(pady=20)
+
+        # Warm up the camera in the background so attendance buttons feel instant
+        self.preload_camera_async()
     
     def add_photo(self):
         """Capture photos for a student"""
@@ -404,9 +618,9 @@ class AttendanceSystem:
         if not os.path.exists(student_photo_dir):
             os.makedirs(student_photo_dir)
         
-        # Initialize camera
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
+        # Initialize camera (reuse warmed instance if available)
+        cap = self.open_camera()
+        if not cap or not cap.isOpened():
             messagebox.showerror("Error", "Could not open camera")
             return
         
@@ -441,7 +655,8 @@ class AttendanceSystem:
             elif key == 27:  # ESC to exit
                 break
         
-        cap.release()
+        self.release_camera()
+        self.preload_camera_async()
         cv2.destroyAllWindows()
         
         messagebox.showinfo("Success", f"Successfully captured {count} photos for {username}")
@@ -450,40 +665,132 @@ class AttendanceSystem:
         """Register a new student (Admin only)"""
         dialog = tk.Toplevel(self.root)
         dialog.title("Register New Student")
-        dialog.geometry("400x200")
+        dialog.geometry("430x380")
         dialog.configure(bg='#f0f0f0')
         
         tk.Label(dialog, text="Student Username:", font=('Arial', 12), bg='#f0f0f0').pack(pady=10)
-        student_username = tk.Entry(dialog, font=('Arial', 12), width=25)
+        student_username = tk.Entry(dialog, font=('Arial', 12), width=28)
         student_username.pack(pady=5)
+        student_username.focus()
+        
+        tk.Label(dialog, text="Email:", font=('Arial', 12), bg='#f0f0f0').pack(pady=10)
+        student_email = tk.Entry(dialog, font=('Arial', 12), width=28)
+        student_email.pack(pady=5)
         
         tk.Label(dialog, text="Password:", font=('Arial', 12), bg='#f0f0f0').pack(pady=10)
-        student_password = tk.Entry(dialog, font=('Arial', 12), width=25, show='*')
+        student_password = tk.Entry(dialog, font=('Arial', 12), width=28, show='*')
         student_password.pack(pady=5)
         
-        def register_student():
-            username = student_username.get()
-            password = student_password.get()
+        otp_frame = tk.Frame(dialog, bg='#f0f0f0')
+        otp_frame.pack(pady=10)
+        
+        tk.Label(otp_frame, text="OTP:", font=('Arial', 12), bg='#f0f0f0').grid(row=0, column=0, padx=5, pady=5)
+        otp_entry = tk.Entry(otp_frame, font=('Arial', 12), width=12)
+        otp_entry.grid(row=0, column=1, padx=5, pady=5)
+        
+        otp_meta = {'code': None, 'expires_at': None, 'email': None}
+        
+        def send_otp():
+            email = student_email.get().strip()
+            if not email:
+                messagebox.showerror("Error", "Please enter an email before requesting OTP.")
+                return
+            if not self.is_valid_email(email):
+                messagebox.showerror("Error", "Please enter a valid email address.")
+                return
             
-            if not username or not password:
-                messagebox.showerror("Error", "Please enter both username and password")
+            otp_value = self.generate_otp()
+            otp_meta['code'] = otp_value
+            otp_meta['expires_at'] = datetime.now() + timedelta(minutes=5)
+            otp_meta['email'] = email.lower()
+            
+            status_label.config(text=f"OTP sent to {email}. (Demo OTP: {otp_value})", fg='blue')
+            messagebox.showinfo("OTP Verification", f"OTP generated for {email}.\n(Use demo OTP: {otp_value})")
+        
+        tk.Button(otp_frame, text="Send OTP", font=('Arial', 10, 'bold'),
+                  bg='#4CAF50', fg='white', width=12, command=send_otp).grid(row=0, column=2, padx=5, pady=5)
+        
+        status_label = tk.Label(dialog, text="", font=('Arial', 10), bg='#f0f0f0', fg='red')
+        status_label.pack(pady=5)
+        
+        def register_student():
+            username = student_username.get().strip()
+            email = student_email.get().strip()
+            password = student_password.get().strip()
+            otp_value = otp_entry.get().strip()
+            
+            status_label.config(text="", fg='red')
+            
+            if not username or not password or not email:
+                status_label.config(text="Please enter username, email, and password")
+                messagebox.showerror("Error", "Please enter username, email, and password")
+                return
+            
+            if len(username) < 3:
+                status_label.config(text="Username must be at least 3 characters")
+                messagebox.showerror("Error", "Username must be at least 3 characters")
+                return
+            
+            if len(password) < 3:
+                status_label.config(text="Password must be at least 3 characters")
+                messagebox.showerror("Error", "Password must be at least 3 characters")
+                return
+            
+            if not self.is_valid_email(email):
+                status_label.config(text="Please enter a valid email")
+                messagebox.showerror("Error", "Please enter a valid email address")
+                return
+            
+            if not otp_meta['code']:
+                status_label.config(text="Please generate OTP before registering")
+                messagebox.showerror("Error", "Please generate OTP before registering")
+                return
+            
+            if not otp_value:
+                status_label.config(text="Please enter the OTP")
+                messagebox.showerror("Error", "Please enter the OTP sent to the email")
+                return
+            
+            if otp_meta['email'] != email.lower():
+                status_label.config(text="Email changed after OTP. Please regenerate OTP.")
+                messagebox.showerror("Error", "Email changed after OTP generation.")
+                return
+            
+            if not otp_meta['expires_at'] or datetime.now() > otp_meta['expires_at']:
+                status_label.config(text="OTP expired. Please request a new one.")
+                messagebox.showerror("Error", "OTP expired. Please request a new one.")
+                return
+            
+            if otp_value != otp_meta['code']:
+                status_label.config(text="Invalid OTP. Please try again.")
+                messagebox.showerror("Error", "Invalid OTP. Please try again.")
                 return
             
             try:
-                self.execute_db('INSERT INTO students (username, password) VALUES (?, ?)', 
-                               (username, password))
+                self.execute_db(
+                    'INSERT INTO users (username, password, email, otp_verified, is_admin) VALUES (?, ?, ?, 1, 0)',
+                    (username, password, email)
+                )
+                self.upsert_student_record(username, password, email)
+                status_label.config(text="Student registered successfully!", fg='green')
                 messagebox.showinfo("Success", f"Student {username} registered successfully!")
                 dialog.destroy()
             except sqlite3.IntegrityError:
+                status_label.config(text="Username already exists")
                 messagebox.showerror("Error", "Student username already exists")
             except sqlite3.OperationalError as e:
                 if "database is locked" in str(e).lower():
+                    status_label.config(text="Database busy. Try again shortly.")
                     messagebox.showerror("Error", "Database is busy. Please try again in a moment.")
                 else:
+                    status_label.config(text=f"Error: {str(e)}")
                     messagebox.showerror("Error", f"Registration failed: {str(e)}")
+            except Exception as e:
+                status_label.config(text=f"Error: {str(e)}")
+                messagebox.showerror("Error", f"Registration failed: {str(e)}")
         
         tk.Button(dialog, text="Register Student", font=('Arial', 12, 'bold'),
-                 bg='#9C27B0', fg='white', width=15, command=register_student).pack(pady=20)
+                  bg='#9C27B0', fg='white', width=18, command=register_student).pack(pady=15)
     
     def train_dataset(self):
         """Train the face recognition model"""
@@ -554,21 +861,16 @@ class AttendanceSystem:
     
     def mark_attendance(self, attendance_type):
         """Mark attendance using face recognition"""
-        # Load trained encodings
-        encoding_file = os.path.join('trained_models', 'face_encodings.pkl')
-        if not os.path.exists(encoding_file):
+        encoding_data = self.load_face_encodings()
+        if encoding_data is None:
             messagebox.showerror("Error", "Model not trained. Please train the dataset first.")
             return
-        
         try:
-            with open(encoding_file, 'rb') as f:
-                encoding_data = pickle.load(f)
+            known_encodings = encoding_data['encodings']
+            known_names = encoding_data['names']
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to load trained model: {str(e)}")
+            messagebox.showerror("Error", f"Trained model is invalid: {str(e)}")
             return
-        
-        known_encodings = encoding_data['encodings']
-        known_names = encoding_data['names']
         
         if len(known_encodings) == 0:
             messagebox.showerror("Error", "No trained faces found. Please train the dataset first.")
@@ -577,15 +879,13 @@ class AttendanceSystem:
         # Close any existing OpenCV windows
         cv2.destroyAllWindows()
         
-        # Initialize camera
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
+        # Initialize camera using optimized helper
+        if not self.camera_ready.is_set():
+            self.preload_camera_async()
+        cap = self.open_camera()
+        if not cap or not cap.isOpened():
             messagebox.showerror("Error", "Could not open camera")
             return
-        
-        # Set camera resolution for better face detection
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         
         # Use consistent window name
         window_name = 'Face Recognition - Attendance ' + attendance_type.upper()
@@ -595,6 +895,7 @@ class AttendanceSystem:
         required_matches = 3  # Require 3 consecutive matches for reliability
         last_recognized_name = None
         frame_count = 0
+        process_every = 2  # process every other frame for speed
         
         while not recognized:
             ret, frame = cap.read()
@@ -605,6 +906,14 @@ class AttendanceSystem:
             
             # Flip frame horizontally for mirror effect
             frame = cv2.flip(frame, 1)
+            
+            if frame_count % process_every != 0:
+                cv2.putText(frame, "Optimizing... hold steady.", (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.imshow(window_name, frame)
+                if cv2.waitKey(1) & 0xFF == 27:
+                    break
+                continue
             
             # Convert BGR to RGB
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -747,8 +1056,9 @@ class AttendanceSystem:
             if cv2.waitKey(1) & 0xFF == 27:  # ESC
                 break
         
-        cap.release()
+        self.release_camera()
         cv2.destroyAllWindows()
+        self.preload_camera_async()
     
     def show_attendance_report(self):
         """Display attendance report"""
@@ -1012,6 +1322,7 @@ class AttendanceSystem:
         """Logout and return to login screen"""
         self.current_user = None
         self.is_admin = False
+        self.release_camera()
         self.show_login_screen()
     
     def clear_window(self):
