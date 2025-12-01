@@ -18,7 +18,7 @@ class AttendanceSystem:
         self.root.title("Facial Recognition Attendance System")
         self.root.geometry("800x600")
         self.root.configure(bg='#f0f0f0')
-        
+          
         self.current_user = None
         self.is_admin = False
         self.camera = None
