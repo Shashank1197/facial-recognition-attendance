@@ -113,6 +113,43 @@ class AttendanceSystem:
                 self.cursor.execute('UPDATE users SET password = ?, is_admin = 1 WHERE username = ?', 
                                   ('admin123', 'admin'))
                 self.conn.commit()
+
+            # Clean up any legacy records for specific users so they don't
+            # appear as students or cause tuple issues.
+            for legacy_user in ('admin2', 'suraj', 'nayak'):
+                try:
+                    # Remove from users, students, and attendance tables
+                    self.cursor.execute('DELETE FROM users WHERE username = ?', (legacy_user,))
+                    self.cursor.execute('DELETE FROM students WHERE username = ?', (legacy_user,))
+                    self.cursor.execute('DELETE FROM attendance WHERE student_username = ?', (legacy_user,))
+                    self.conn.commit()
+                except Exception:
+                    # Non‑critical cleanup; ignore failures for each user
+                    pass
+
+                # Remove any photo folders for these users
+                try:
+                    photo_dir = os.path.join('photos', legacy_user)
+                    if os.path.exists(photo_dir):
+                        shutil.rmtree(photo_dir, ignore_errors=True)
+                except Exception:
+                    # Ignore filesystem errors as well
+                    pass
+
+            # Ensure that an existing "anand" login (if any) is mirrored into the students table
+            try:
+                self.cursor.execute(
+                    'SELECT username, password, COALESCE(email, "") FROM users WHERE username = ?',
+                    ('anand',)
+                )
+                row = self.cursor.fetchone()
+                if row:
+                    username, password, email = row
+                    # Reuse helper to keep students table in sync
+                    self.upsert_student_record(username, password, email)
+            except Exception:
+                # If anything goes wrong here, don't block app startup
+                pass
         except Exception as e:
             print(f"Warning: Could not create/update admin user: {e}")
             # Try to continue anyway
@@ -1237,7 +1274,11 @@ class AttendanceSystem:
                 records = self.execute_db('SELECT username, password FROM students ORDER BY username', 
                                         fetch=True)
                 for record in records:
-                    students_tree.insert('', 'end', values=record)
+                    # Be defensive: ensure each row is a proper 2‑item tuple for Treeview
+                    if not isinstance(record, (list, tuple)) or len(record) < 2:
+                        continue
+                    username, password = record[0], record[1]
+                    students_tree.insert('', 'end', values=(username, password))
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to load students: {str(e)}")
         
