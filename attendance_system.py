@@ -258,7 +258,7 @@ class AttendanceSystem:
         return None
 
     def preload_camera_async(self):
-        """Open the camera on a background thread to reduce user wait time"""
+        """Open the camera on the background thread to reduce user wait time"""
         if self.camera_thread and self.camera_thread.is_alive():
             return
 
