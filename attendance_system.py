@@ -116,7 +116,8 @@ class AttendanceSystem:
 
             # Clean up any legacy records for specific users so they don't
             # appear as students or cause tuple issues.
-            for legacy_user in ('admin2', 'suraj', 'nayak'):
+            cleanup_users = ('admin2', 'suraj', 'nayak', 'prashant', 'demo', 'shashank', 'nikhil')
+            for legacy_user in cleanup_users:
                 try:
                     # Remove from users, students, and attendance tables
                     self.cursor.execute('DELETE FROM users WHERE username = ?', (legacy_user,))

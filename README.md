@@ -67,6 +67,26 @@ A Python-based facial recognition attendance system for college students using O
 - Click "Attendance Report" button
 - View all attendance records with dates, times, and status
 
+## Screenshots
+
+### Register New User
+![Register New User](screenshots/01-register-new-user.png)
+
+### Login
+![Login](screenshots/02-login.png)
+
+### Admin Profile
+![Admin Profile](screenshots/03-admin-profile.png)
+
+### Add Photo
+![Add Photo](screenshots/04-add-photo.png)
+
+### Attendance Report
+![Attendance Report](screenshots/05-attendance-report.png)
+
+### Admin Dashboard
+![Admin Dashboard](screenshots/06-admin-dashboard.png)
+
 ## Database
 
 The system uses SQLite database (`attendance.db`) to store:
